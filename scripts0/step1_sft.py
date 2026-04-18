@@ -7,6 +7,7 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
+import inspect
 import torch
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -64,7 +65,7 @@ def load_model_and_tokenizer():
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
     )
     model = AutoModelForCausalLM.from_pretrained(
@@ -90,7 +91,9 @@ def load_model_and_tokenizer():
 
 # ── 3. 训练 ──────────────────────────────────────────
 def train(model, tokenizer, dataset):
-    sft_config = SFTConfig(
+    # 兼容不同 trl 版本：有的版本把 dataset_text_field/max_seq_length 放在 SFTTrainer，
+    # 有的版本放在 SFTConfig；tokenizer 参数名也可能是 tokenizer 或 processing_class。
+    sft_kwargs = dict(
         output_dir=OUTPUT_DIR,
         num_train_epochs=NUM_EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
@@ -105,16 +108,37 @@ def train(model, tokenizer, dataset):
         optim="paged_adamw_32bit",
         report_to="none",
         dataloader_num_workers=2,
-        dataset_text_field="text",
-        max_seq_length=MAX_LENGTH,
         packing=False,
     )
-    trainer = SFTTrainer(
+    sft_fields = getattr(SFTConfig, "__dataclass_fields__", {})
+    if "dataset_text_field" in sft_fields:
+        sft_kwargs["dataset_text_field"] = "text"
+    if "max_seq_length" in sft_fields:
+        sft_kwargs["max_seq_length"] = MAX_LENGTH
+    elif "max_length" in sft_fields:
+        sft_kwargs["max_length"] = MAX_LENGTH
+
+    sft_config = SFTConfig(**sft_kwargs)
+
+    trainer_kwargs = dict(
         model=model,
         args=sft_config,
         train_dataset=dataset,
-        processing_class=tokenizer,
     )
+    sig = inspect.signature(SFTTrainer.__init__)
+    if "processing_class" in sig.parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in sig.parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    if "dataset_text_field" in sig.parameters and "dataset_text_field" not in sft_kwargs:
+        trainer_kwargs["dataset_text_field"] = "text"
+    if "max_seq_length" in sig.parameters and "max_seq_length" not in sft_kwargs:
+        trainer_kwargs["max_seq_length"] = MAX_LENGTH
+    elif "max_length" in sig.parameters and "max_length" not in sft_kwargs:
+        trainer_kwargs["max_length"] = MAX_LENGTH
+
+    trainer = SFTTrainer(**trainer_kwargs)
     trainer.train()
     return trainer
 
